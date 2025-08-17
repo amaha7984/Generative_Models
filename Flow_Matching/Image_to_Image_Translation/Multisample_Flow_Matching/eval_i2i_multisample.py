@@ -16,10 +16,10 @@ class EvalPairDataset(Dataset):
         self.to_src  = T.Compose([T.Resize((size, size)), T.ToTensor(), T.Lambda(lambda x: x*2-1)])  # [-1,1]
         self.to_real = T.Compose([T.Resize((size, size)), T.ToTensor()])                              # [0,1]
 
-        a_names = sorted([n for n in os.listdir(sat_dir)
-                          if n.endswith((".jpg", ".png")) and "_A." in n])
+        a_names = sorted([n for n in os.listdir(sat_dir) if n.endswith((".jpg", ".png")) and "_A." in n])
         self.pairs = []
         for n in a_names:
+            # 10554_A.jpg -> 10554_B.jpg (keeps the same extension)
             base, ext = os.path.splitext(n)
             m = base.replace("_A", "_B") + ext
             if os.path.exists(os.path.join(map_dir, m)):
@@ -38,53 +38,47 @@ class EvalPairDataset(Dataset):
 
 
 @torch.no_grad()
-def _rk4_generate(model, x_src_pm1, steps=50, x_t0=None):
-    """RK4 integrator for flow matching ODE."""
+def _rk4_generate(model, x_src_pm1, steps=50):
+    """Option-A RK4: start from noise; dx/dt = v_theta(x,t|x_src)."""
     device = x_src_pm1.device
-    x = torch.randn_like(x_src_pm1) if x_t0 is None else x_t0.clone()
-
+    x = torch.randn_like(x_src_pm1)
     ts = torch.linspace(0.0, 1.0, steps+1, device=device)
     for i in range(steps):
         t0, t1 = ts[i].item(), ts[i+1].item()
         h = t1 - t0
-
         def f(t_s, x_s):
             tb = torch.full((x_s.size(0),), t_s, device=device, dtype=x_s.dtype)
             xin = torch.cat([x_s, x_src_pm1], dim=1)
             return model(xin, tb, extra={})
-
         k1 = f(t0, x)
-        k2 = f(t0 + 0.5*h, x + 0.5*h*k1)
-        k3 = f(t0 + 0.5*h, x + 0.5*h*k2)
-        k4 = f(t0 + h,     x + h*k3)
+        k2 = f(t0+0.5*h, x+0.5*h*k1)
+        k3 = f(t0+0.5*h, x+0.5*h*k2)
+        k4 = f(t0+h,     x+h*k3)
         x  = x + (h/6.0)*(k1 + 2*k2 + 2*k3 + k4)
     return x
 
-
-def _pm1_to_01(x):  # for saving & FID
-    return (x.clamp(-1,1)+1)/2
-
+def _pm1_to_01(x): return (x.clamp(-1,1)+1)/2
 
 @torch.no_grad()
 def eval_fid_i2i(
     model, device,
     sat_dir, map_dir,
     out_dir, epoch, steps=50, batch_size=16, num_workers=4,
-    save_samples=10,
-    ot_sampler=None
+    save_samples=10
 ):
     """
-    - Distributed FID: each rank renders a shard; compute() synchronizes.
-    - If ot_sampler is provided, couple (noise, data) per batch via OT (same as training).
+    - Generates 5000 images (not saved), computes FID vs testB_5000, writes fid.txt
+    - Saves ONLY `save_samples` visual triptychs (src|gt|gen) for inspection.
     """
     os.makedirs(out_dir, exist_ok=True)
     model.eval()
 
-    # DDP info
+    # Dist info
     is_dist  = dist.is_available() and dist.is_initialized()
     rank     = dist.get_rank() if is_dist else 0
     world    = dist.get_world_size() if is_dist else 1
     is_rank0 = (rank == 0)
+
 
     ds = EvalPairDataset(sat_dir, map_dir, size=256)
     sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=False, drop_last=False) if is_dist else None
@@ -93,67 +87,55 @@ def eval_fid_i2i(
 
     fid = FrechetInceptionDistance(normalize=True).to(device)
 
-    # Save a few visual triptychs from rank 0
+    # Save a few visual samples (triptychs) using the same RK4 path
+   
     if is_rank0 and save_samples > 0:
         sample_dir = os.path.join(out_dir, f"epoch_{epoch}_samples")
         os.makedirs(sample_dir, exist_ok=True)
         idxs = random.sample(range(len(ds)), min(save_samples, len(ds)))
         for i, idx in enumerate(idxs):
             b  = ds[idx]
-            x_src = b["sat_pm1"].unsqueeze(0).to(device)  # [-1,1]
-            x_real01 = b["map_01"].unsqueeze(0).to(device)  # [0,1]
-            x_real_pm1 = x_real01 * 2 - 1                  # [-1,1] for coupling only
-
-            noise = torch.randn_like(x_src)
-            if ot_sampler is not None:
-                noise, _ = ot_sampler.sample_plan(noise, x_real_pm1)
-
-            gen_pm1 = _rk4_generate(model, x_src, steps=steps, x_t0=noise)
-            gen01   = _pm1_to_01(gen_pm1)
-
-            vis = torch.cat([x_src*0.5+0.5, x_real01, gen01], dim=0)
+            x0 = b["sat_pm1"].unsqueeze(0).to(device)
+            x1 = b["map_01"].unsqueeze(0).to(device)
+            gen = _rk4_generate(model, x0, steps=steps)
+            gen01 = _pm1_to_01(gen)
+            vis = torch.cat([x0*0.5+0.5, x1, gen01], dim=0)
             save_image(vis, os.path.join(sample_dir, f"{i:02d}.png"), nrow=3)
+            del x0, x1, gen, gen01, vis
 
-            del x_src, x_real01, x_real_pm1, noise, gen_pm1, gen01, vis
-
-    # Progress bar on rank 0
+    # Progress bar (rank 0 shows its shard progress)
     total_local = len(sampler) if sampler is not None else len(ds)
     pbar = tqdm(total=total_local,
                 desc=f"FID (epoch {epoch}) [rank {rank}/{world}]",
                 ncols=100, disable=not is_rank0)
 
+    # Full FID pass on each rank’s shard
     if is_dist and sampler is not None:
-        sampler.set_epoch(epoch)
+        sampler.set_epoch(epoch)  # deterministic sharding
 
-    # FID loop
     for batch in dl:
-        real01 = batch["map_01"].to(device, non_blocking=True)   # [0,1] for FID
-        x_src  = batch["sat_pm1"].to(device, non_blocking=True)  # [-1,1] conditioning
+        real01 = batch["map_01"].to(device, non_blocking=True)  # [0,1]
+        x_src  = batch["sat_pm1"].to(device, non_blocking=True) # [-1,1]
         fid.update(real01, real=True)
-
-        noise = torch.randn_like(x_src)
-        if ot_sampler is not None:
-            # Couple against target in [-1,1], like training
-            x1_pm1 = real01 * 2 - 1
-            noise, _ = ot_sampler.sample_plan(noise, x1_pm1)
-
-        gen_pm1 = _rk4_generate(model, x_src, steps=steps, x_t0=noise)
+        gen_pm1 = _rk4_generate(model, x_src, steps=steps)
         gen01   = _pm1_to_01(gen_pm1)
         fid.update(gen01, real=False)
-
         if is_rank0:
             pbar.update(real01.size(0))
 
-        del real01, x_src, noise, gen_pm1, gen01
+        del real01, x_src, gen_pm1, gen01
 
     if is_rank0:
         pbar.close()
+    
+    
 
-    if is_dist:
-        dist.barrier()
+    # Make sure all ranks finished updates before compute
+    if is_dist: dist.barrier()
 
-    fid_val = float(fid.compute().detach().cpu())
+    fid_val = float(fid.compute().detach().cpu())  # synced across ranks
 
+    # Log once
     if is_rank0:
         log_path   = os.path.join(out_dir, "fid_scores.txt")
         need_header = not os.path.exists(log_path)
@@ -162,11 +144,13 @@ def eval_fid_i2i(
                 f.write("epoch\tfid\n")
             f.write(f"{epoch}\t{fid_val:.6f}\n")
 
-    if is_dist:
-        dist.barrier()
+    # Keep ranks aligned before returning
+    if is_dist: dist.barrier()
+    fid.reset() 
 
-    fid.reset()
     torch.cuda.synchronize()
+
+    del dl, ds, fid
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
     return fid_val
