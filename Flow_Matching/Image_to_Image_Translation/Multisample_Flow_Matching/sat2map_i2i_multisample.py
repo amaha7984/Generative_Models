@@ -19,7 +19,7 @@ from flow_matching.path.affine import AffineProbPath
 
 from torchvision.utils import save_image
 import random
-from fid_eval_i2i import eval_fid_i2i
+from eval_i2i_multisample import eval_fid_i2i
 
 # ---- BatchOT (multisample) sampler ----
 
