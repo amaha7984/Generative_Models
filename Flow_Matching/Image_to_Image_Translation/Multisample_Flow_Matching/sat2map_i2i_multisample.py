@@ -1,4 +1,4 @@
-# sat2map_multisample.py
+# sat2map_multisample.py:
 import os
 import time
 import argparse
@@ -22,9 +22,8 @@ import random
 from fid_eval_i2i import eval_fid_i2i
 
 # ---- BatchOT (multisample) sampler ----
-# This file must be created (you already planned this) by copying OTPlanSampler
-# from the official repo. See msfm_optimal_transport.py you created.
-from msfm_optimal_transport import OTPlanSampler
+
+from ot_sampler import OTPlanSampler
 
 
 def setup_ddp(rank, world_size):
@@ -45,7 +44,7 @@ def main(rank, world_size, args):
 
     # -------- Paths --------
     DATA_ROOT = "/aul/homes/amaha038/Mapsgeneration/TerraFlySat_and_MapDatatset/TerraFly_Full_Map&Satellite_Dataset/Final_Sat_Map_Dataset"
-    SAVE_DIR = "/aul/homes/amaha038/Generation/Generative_Models/Flow_Matching/Flow_Matching_Complete/I2I_Sat2Map_Multisample/weights/tests"
+    SAVE_DIR = "/aul/homes/amaha038/Generation/Generative_Models/Flow_Matching/Flow_Matching_Complete/I2I_Sat2Map_Multisample/weights/multisample_400"
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     # -------- Data Loading --------
@@ -159,45 +158,53 @@ def main(rank, world_size, args):
 
         # -------- End of epoch --------
         torch.cuda.synchronize()
-        dist.barrier()  # <-- make ALL ranks arrive here together
+        dist.barrier()  # <-- making ALL ranks arrive here together
 
         avg_loss = total_loss / len(dataloader)
         if rank == 0:
             print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f}")
 
-        # Eval interval: run FID on ALL ranks (distributed)
+        # Eval interval: running FID on ALL ranks (distributed)
         if (epoch + 1) % args.eval_interval == 0:
-            sat_dir = "/aul/homes/amaha038/Mapsgeneration/TerraFlySat_and_MapDatatset/TerraFly_Full_Map&Satellite_Dataset/Final_Sat_Map_Dataset/testA_5000"
-            map_dir = "/aul/homes/amaha038/Mapsgeneration/TerraFlySat_and_MapDatatset/TerraFly_Full_Map&Satellite_Dataset/Final_Sat_Map_Dataset/testB_5000"
+            if args.no_fid:
+                # just saving the checkpoint, no FID pass
+                if rank == 0:
+                    ckpt_path = os.path.join(SAVE_DIR, f"model_epoch{epoch+1}.pth")
+                    torch.save(model.module.state_dict(), ckpt_path)
+                    print(f"[Epoch {epoch+1}] Saved checkpoint (no FID).")
+                dist.barrier()
+            else:
+                sat_dir = "/aul/homes/amaha038/Mapsgeneration/TerraFlySat_and_MapDatatset/TerraFly_Full_Map&Satellite_Dataset/Final_Sat_Map_Dataset/testA_5000"
+                map_dir = "/aul/homes/amaha038/Mapsgeneration/TerraFlySat_and_MapDatatset/TerraFly_Full_Map&Satellite_Dataset/Final_Sat_Map_Dataset/testB_5000"
 
-            fid_val = eval_fid_i2i(
-                model.module, device=local_rank,
-                sat_dir=sat_dir, map_dir=map_dir,
-                out_dir=SAVE_DIR, epoch=epoch+1,
-                steps=50, batch_size=32, num_workers=args.num_workers,
-                save_samples=10
-            )
+                fid_val = eval_fid_i2i(
+                    model.module, device=local_rank,
+                    sat_dir=sat_dir, map_dir=map_dir,
+                    out_dir=SAVE_DIR, epoch=epoch+1,
+                    steps=50, batch_size=32, num_workers=args.num_workers,
+                    save_samples=10
+                )
 
-            # after eval returns, free cached blocks on this rank
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+                # after eval returns, free cached blocks on this rank
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
 
-            # Rank 0 logs & saves; others just participate
-            if rank == 0:
-                print(f"[Epoch {epoch+1}] FID: {fid_val:.6f}")
-                ckpt_path = os.path.join(SAVE_DIR, f"model_epoch{epoch+1}.pth")
-                torch.save(model.module.state_dict(), ckpt_path)
+                # Rank 0 logs & saves; others just participate
+                if rank == 0:
+                    print(f"[Epoch {epoch+1}] FID: {fid_val:.6f}")
+                    ckpt_path = os.path.join(SAVE_DIR, f"model_epoch{epoch+1}.pth")
+                    torch.save(model.module.state_dict(), ckpt_path)
 
-                if not hasattr(main, "_best_fid"):
-                    main._best_fid = float("inf")
-                if fid_val < main._best_fid:
-                    main._best_fid = fid_val
-                    best_path = os.path.join(SAVE_DIR, "model_best_fid.pth")
-                    torch.save(model.module.state_dict(), best_path)
-                    print(f"[Epoch {epoch+1}] New best FID ({fid_val:.6f}). Saved: {best_path}")
+                    if not hasattr(main, "_best_fid"):
+                        main._best_fid = float("inf")
+                    if fid_val < main._best_fid:
+                        main._best_fid = fid_val
+                        best_path = os.path.join(SAVE_DIR, "model_best_fid.pth")
+                        torch.save(model.module.state_dict(), best_path)
+                        print(f"[Epoch {epoch+1}] New best FID ({fid_val:.6f}). Saved: {best_path}")
 
-            dist.barrier()  # <-- everyone waits until rank 0 finishes I/O
+                dist.barrier()  # <-- everyone waits until rank 0 finishes I/O
 
         lr_sched.step()
 
@@ -217,6 +224,8 @@ if __name__ == "__main__":
     parser.add_argument("--ot_reg", type=float, default=0.05, help="Entropic regularization (used by sinkhorn/partial/unbalanced)")
     parser.add_argument("--ot_reg_m", type=float, default=1.0, help="Marginal relaxation (only for unbalanced)")
     parser.add_argument("--ot_normalize_cost", action="store_true", help="Divide cost matrix by its max before OT")
+    parser.add_argument("--no_fid", action="store_true",
+                    help="Skip FID evaluation during training (still saves checkpoints).")
 
     args = parser.parse_args()
 
