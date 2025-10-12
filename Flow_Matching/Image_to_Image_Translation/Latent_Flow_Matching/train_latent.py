@@ -22,6 +22,9 @@ from fid_eval_i2i import eval_fid_i2i
 # NEW: SD VAE for latent space
 from diffusers.models import AutoencoderKL
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 
 def setup_ddp(rank, world_size):
     """Initialize distributed process group (NCCL) and set device."""
@@ -40,8 +43,8 @@ def main(rank, world_size, args):
     local_rank = setup_ddp(rank, world_size)
 
     # -------- Paths --------
-    DATA_ROOT = "/aul/homes/amaha038/Mapsgeneration/google_mapsdataset"
-    SAVE_DIR = "/aul/homes/amaha038/Generation/Generative_Models/Flow_Matching/Flow_Matching_Complete/I2I_Sat2Map/weights/condpath_googlemap_400"
+    DATA_ROOT = "/path/google_mapsdataset"
+    SAVE_DIR = "/path/condpath_googlemap_400"
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     # -------- Data Loading --------
@@ -163,8 +166,8 @@ def main(rank, world_size, args):
                     print(f"[Epoch {epoch+1}] Saved checkpoint (no FID).")
                 dist.barrier()
             else:
-                sat_dir = "/aul/homes/amaha038/Mapsgeneration/TerraFlySat_and_MapDatatset/TerraFly_Full_Map&Satellite_Dataset/Final_Sat_Map_Dataset/testA_5000"
-                map_dir = "/aul/homes/amaha038/Mapsgeneration/TerraFlySat_and_MapDatatset/TerraFly_Full_Map&Satellite_Dataset/Final_Sat_Map_Dataset/testB_5000"
+                sat_dir = "/path/testA_5000"
+                map_dir = "/path/testB_5000"
 
                 # FID will instantiate its own frozen VAE and decode for metrics
                 fid_val = eval_fid_i2i(
