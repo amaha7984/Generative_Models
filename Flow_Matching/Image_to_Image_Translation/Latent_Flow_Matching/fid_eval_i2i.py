@@ -52,7 +52,7 @@ def _rk4_generate_latent(model, z_src, steps=50):
     """
     device = z_src.device
     z = torch.randn_like(z_src)
-    ts = torch.linspace(0.0, 1.0, steps+1, device=device)
+    ts = torch.linspace(1.0, 0.0, steps+1, device=device)
     for i in range(steps):
         t0, t1 = ts[i].item(), ts[i+1].item()
         h = t1 - t0
