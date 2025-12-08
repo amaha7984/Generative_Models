@@ -162,7 +162,8 @@ def main(rank, world_size, args):
     # ---------------------------------------------------------
     # Loss & AMP
     # ---------------------------------------------------------
-    criterion = nn.MSELoss()
+    # criterion = nn.MSELoss()
+    criterion = nn.SmoothL1Loss(beta=0.5)
     scaler = torch.cuda.amp.GradScaler()
     eps = 1e-3   # smallest t (like in rectified flow code)
 
@@ -255,7 +256,7 @@ def main(rank, world_size, args):
                     map_dir=args.testB,
                     out_dir=SAVE_DIR,
                     epoch=epoch + 1,
-                    steps=50,
+                    steps=200,
                     batch_size=32,
                     num_workers=args.num_workers,
                     save_samples=10,
