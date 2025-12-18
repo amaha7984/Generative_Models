@@ -1,5 +1,5 @@
 # Unpaired Image-to-Image Translation with Flow Matching in Latent Space (Unsupervised Domain Translation)
-## This project explores development of Generative Model based on Flow Matching principle as introduced by Lipman et al. 
-## Reference: https://github.com/facebookresearch/flow_matching
-## We have investigated the optimal path construction between two unknown distribution without having paired input and target images.
 
+## This project explores the development of generative models based on the Flow Matching principle introduced by Lipman et al.
+## Reference: https://github.com/facebookresearch/flow_matching
+## We investigate optimal path construction between two unknown distributions without requiring paired input–target images.
