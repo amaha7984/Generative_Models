@@ -4,4 +4,7 @@
 - Reference: https://github.com/facebookresearch/flow_matching
 - We investigate optimal path construction between two unknown distributions without requiring paired input–target images.
 - We have also explored patch-wise feature correspondence with DINOv3.
-- We have explored dependent coupling with several conditions to address the limitation independent coupling.
+- We explored dependent coupling with multiple pairing conditions to overcome limitations of independent coupling:
+  - OT coupling (Sinkhorn / Exact EMD)
+  
+
