@@ -17,7 +17,9 @@ from datasets import GenericI2IDataset
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from models.unet import UNetModel
-from ot_coupling_refinement import minibatch_ot_sample_plan
+
+# UPDATED import: unified pairing selector
+from ot_coupling_multiple_pair_selection import minibatch_pair_sample_plan
 
 from fid_eval_i2i_ot_coupling import eval_fid_i2i_rectified
 
@@ -94,7 +96,7 @@ def _append_line(path: str, line: str):
 
 
 # -----------------------------
-# GLOBAL OT MATCHING (DDP-safe)
+# GLOBAL PAIRING (DDP-safe)
 # -----------------------------
 @torch.no_grad()
 def _gather_cat(x: torch.Tensor) -> torch.Tensor:
@@ -108,29 +110,28 @@ def _gather_cat(x: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def global_minibatch_ot_sample_plan(
+def global_minibatch_pair_sample_plan(
     z0_local: torch.Tensor,
     z1_local: torch.Tensor,
-    ot_method: str,
-    ot_eps: float,
-    ot_iters: int,
-    ot_replace: bool,
-    ot_num_threads: int,
+    args,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute OT plan sampling over the *global* batch (across all ranks),
+    Compute pairing over the *global* batch (across all ranks),
     then return paired (z0_pi, z1_pi) for the *local* slice.
     """
     # Single-process fallback
     if not (dist.is_available() and dist.is_initialized()):
-        z0_pi, z1_pi = minibatch_ot_sample_plan(
+        z0_pi, z1_pi = minibatch_pair_sample_plan(
             z0_local,
             z1_local,
-            ot_method=ot_method,
-            eps=ot_eps,
-            iters=ot_iters,
-            replace=ot_replace,
-            num_threads=ot_num_threads,
+            pairing=args.pairing,
+            ot_method=args.ot_method,
+            eps=args.ot_eps,
+            iters=args.ot_iters,
+            replace=args.ot_replace,
+            num_threads=args.ot_num_threads,
+            mnn_min_mutual_frac=args.mnn_min_mutual_frac,
+            softmax_tau=args.softmax_tau,
         )
         return z0_pi, z1_pi
 
@@ -140,15 +141,18 @@ def global_minibatch_ot_sample_plan(
     z0_all = _gather_cat(z0_local)
     z1_all = _gather_cat(z1_local)
 
-    # OT plan sampling on global batch
-    z0_pi_all, z1_pi_all = minibatch_ot_sample_plan(
+    # Pairing on global batch
+    z0_pi_all, z1_pi_all = minibatch_pair_sample_plan(
         z0_all,
         z1_all,
-        ot_method=ot_method,
-        eps=ot_eps,
-        iters=ot_iters,
-        replace=ot_replace,
-        num_threads=ot_num_threads,
+        pairing=args.pairing,
+        ot_method=args.ot_method,
+        eps=args.ot_eps,
+        iters=args.ot_iters,
+        replace=args.ot_replace,
+        num_threads=args.ot_num_threads,
+        mnn_min_mutual_frac=args.mnn_min_mutual_frac,
+        softmax_tau=args.softmax_tau,
     )
 
     # Return this rank's local block
@@ -259,7 +263,7 @@ def main(rank, world_size, args):
         total_loss = 0.0
 
         if rank0:
-            print(f"\n[Epoch {epoch+1}/{args.epochs}]")
+            print(f"\n[Epoch {epoch+1}/{args.epochs}] (pairing={args.pairing})")
 
         pbar = tqdm(dataloader, desc=f"[GPU {local_rank}] Epoch {epoch+1}", disable=(not rank0))
 
@@ -272,20 +276,16 @@ def main(rank, world_size, args):
             t = torch.rand(B, device=local_rank)
             t_b = t.view(B, 1, 1, 1)
 
-            # ------------ VAE Encoding (π0, π1) + GLOBAL OT plan sampling ------------
+            # ------------ VAE Encoding (π0, π1) + GLOBAL pairing (DDP-safe) ------------
             with torch.no_grad():
                 z0 = vae.encode(x_src).latent_dist.sample() * scale_factor
                 z1 = vae.encode(x_tgt).latent_dist.sample() * scale_factor
 
-                # GLOBAL minibatch OT plan sampling (DDP-safe)
-                z0_pi, z1_pi = global_minibatch_ot_sample_plan(
+                # GLOBAL pairing on global batch
+                z0_pi, z1_pi = global_minibatch_pair_sample_plan(
                     z0_local=z0,
                     z1_local=z1,
-                    ot_method=args.ot_method,          # exact default
-                    ot_eps=args.ot_eps,                # used only for sinkhorn
-                    ot_iters=args.ot_iters,            # used only for sinkhorn
-                    ot_replace=args.ot_replace,        # closest to official sampling
-                    ot_num_threads=args.ot_num_threads # exact OT threads
+                    args=args,
                 )
 
                 # Deterministic ODE-style linear path
@@ -391,8 +391,23 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_steps", type=int, default=2000,
                         help="Number of warmup steps for learning rate.")
 
-    # OT / coupling
-    parser.add_argument("--ot_method", type=str, default="exact", choices=["exact", "sinkhorn"],
+    # -----------------------------
+    # Pairing strategy (NEW)
+    # -----------------------------
+    parser.add_argument("--pairing", type=str, default="ot",
+                        choices=["ot", "mnn", "hungarian", "softmax"],
+                        help="Batch pairing strategy for unpaired coupling.")
+
+    # Softmax baseline (optional)
+    parser.add_argument("--softmax_tau", type=float, default=0.1,
+                        help="Temperature for --pairing softmax (lower = sharper).")
+
+    # MNN option
+    parser.add_argument("--mnn_min_mutual_frac", type=float, default=0.25,
+                        help="MNN: if mutual matches >= this fraction of batch, refresh non-mutual pairs from mutual pool.")
+
+    # OT / coupling (unchanged)
+    parser.add_argument("--ot_method", type=str, default="sinkhorn", choices=["exact", "sinkhorn"],
                         help="OT solver: exact (POT emd, CPU) or sinkhorn (entropic, GPU).")
     parser.add_argument("--ot_eps", type=float, default=0.05,
                         help="Entropic regularization epsilon for Sinkhorn (ignored for exact).")
