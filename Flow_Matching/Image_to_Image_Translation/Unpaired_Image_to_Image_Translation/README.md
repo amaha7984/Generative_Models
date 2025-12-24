@@ -8,4 +8,6 @@
   - OT coupling (Sinkhorn / Exact EMD)
   - Mutual-NN coupling
   - Hungarian one-to-one coupling
+  - Softmax (temperature) coupling
+
   
