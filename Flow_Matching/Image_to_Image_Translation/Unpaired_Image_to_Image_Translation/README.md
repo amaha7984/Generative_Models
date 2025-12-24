@@ -6,5 +6,6 @@
 - We have also explored patch-wise feature correspondence with DINOv3.
 - We explored dependent coupling with multiple pairing conditions to overcome limitations of independent coupling:
   - OT coupling (Sinkhorn / Exact EMD)
+  - Mutual-NN coupling
+  - Hungarian one-to-one coupling
   
-
