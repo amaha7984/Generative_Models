@@ -1,7 +1,6 @@
 # ot_coupling.py
 import torch
 
-
 # -------------------------
 # OT solvers
 # -------------------------
@@ -18,11 +17,9 @@ def sinkhorn_log_domain(cost, eps=0.05, iters=50):
 
     logK = -cost / eps
 
-    # log u, log v for stability
     log_u = torch.zeros(B, device=device, dtype=dtype)
     log_v = torch.zeros(B, device=device, dtype=dtype)
 
-    # uniform marginals: log(1/B)
     log_a = torch.full(
         (B,),
         -torch.log(torch.tensor(float(B), device=device, dtype=dtype)),
@@ -52,7 +49,7 @@ def compute_ot_plan(cost, method="exact", eps=0.05, iters=50, num_threads=1):
 
     if method == "exact":
         # Exact EMD via POT (CPU)
-        import ot as pot 
+        import ot as pot  # pip install pot
 
         B = cost.shape[0]
         a = pot.unif(B)
@@ -100,9 +97,6 @@ def _sample_pairs_from_plan(P, num_pairs, replace=True):
 
 @torch.no_grad()
 def _pairing_ot(cost, ot_method="exact", eps=0.05, iters=50, replace=True, num_threads=1):
-    """
-    OT-based probabilistic pairing.
-    """
     P = compute_ot_plan(cost, method=ot_method, eps=eps, iters=iters, num_threads=num_threads)
     i, j = _sample_pairs_from_plan(P, num_pairs=cost.shape[0], replace=replace)
     return i, j
@@ -111,32 +105,22 @@ def _pairing_ot(cost, ot_method="exact", eps=0.05, iters=50, replace=True, num_t
 @torch.no_grad()
 def _pairing_mnn(cost, min_mutual_frac=0.25, replace=True):
     """
-    Mutual Nearest Neighbor (MNN) selection:
-      - For each i: NN j
-      - For each j: NN i
-      - Keep mutual matches; if too few, fallback to per-i NN,
-        optionally re-sampling j from mutual pool to reduce collapse.
-
+    Mutual Nearest Neighbor (MNN) selection.
     Returns i=0..B-1 and j indices length B.
     """
     B = cost.shape[0]
     device = cost.device
 
-    # i -> j nearest neighbor
     i_to_j = torch.argmin(cost, dim=1)  # (B,)
-    # j -> i nearest neighbor
     j_to_i = torch.argmin(cost, dim=0)  # (B,)
 
     ar = torch.arange(B, device=device)
-    mutual_mask = (j_to_i[i_to_j] == ar)  # (B,)
+    mutual_mask = (j_to_i[i_to_j] == ar)
     mutual_i = torch.nonzero(mutual_mask, as_tuple=False).squeeze(1)
     mutual_j = i_to_j[mutual_i]
 
-    # Default: plain NN for all i
     j = i_to_j.clone()
 
-    # If enough mutuals exist, optionally "refresh" non-mutual i's by sampling mutual j's
-    # This keeps selection stable and avoids many-to-one NN collapse.
     if mutual_i.numel() >= int(B * float(min_mutual_frac)) and mutual_i.numel() > 0:
         non_mutual_i = torch.nonzero(~mutual_mask, as_tuple=False).squeeze(1)
         if non_mutual_i.numel() > 0:
@@ -144,10 +128,8 @@ def _pairing_mnn(cost, min_mutual_frac=0.25, replace=True):
                 pick = torch.randint(low=0, high=mutual_j.numel(),
                                      size=(non_mutual_i.numel(),), device=device)
             else:
-                # Without replacement: limit by pool size
                 perm = torch.randperm(mutual_j.numel(), device=device)
                 pick = perm[: min(non_mutual_i.numel(), mutual_j.numel())]
-                # If still short, just pad with random picks
                 if pick.numel() < non_mutual_i.numel():
                     extra = torch.randint(low=0, high=mutual_j.numel(),
                                           size=(non_mutual_i.numel() - pick.numel(),), device=device)
@@ -161,9 +143,6 @@ def _pairing_mnn(cost, min_mutual_frac=0.25, replace=True):
 
 @torch.no_grad()
 def _pairing_hungarian(cost):
-    """
-    Hard one-to-one min-cost assignment within the batch.
-    """
     try:
         from scipy.optimize import linear_sum_assignment
     except Exception as e:
@@ -181,14 +160,11 @@ def _pairing_hungarian(cost):
 @torch.no_grad()
 def _pairing_softmax(cost, tau=0.1, replace=True):
     """
-    Lightweight probabilistic pairing (ablation):
-      p(j|i) ∝ exp(-C_ij / tau). No marginal constraints.
+    p(j|i) ∝ exp(-C_ij / tau). No marginal constraints.
     """
     B = cost.shape[0]
     logits = -cost / max(1e-8, float(tau))
     probs = torch.softmax(logits, dim=1)  # (B,B)
-
-    # sample one j per i
     j = torch.multinomial(probs, num_samples=1, replacement=True).squeeze(1)
     i = torch.arange(B, device=cost.device)
     return i, j
@@ -197,6 +173,36 @@ def _pairing_softmax(cost, tau=0.1, replace=True):
 # -------------------------
 # Unified API
 # -------------------------
+@torch.no_grad()
+def minibatch_pair_indices_from_cost(
+    cost: torch.Tensor,
+    pairing="ot",                 # {"ot","mnn","hungarian","softmax"}
+    ot_method="exact",
+    eps=0.05,
+    iters=50,
+    replace=True,
+    num_threads=1,
+    mnn_min_mutual_frac=0.25,
+    softmax_tau=0.1,
+):
+    """
+    cost: (B,B)
+    Returns: i, j indices (both length B).
+    """
+    if pairing == "ot":
+        i, j = _pairing_ot(cost, ot_method=ot_method, eps=eps, iters=iters,
+                           replace=replace, num_threads=num_threads)
+    elif pairing == "mnn":
+        i, j = _pairing_mnn(cost, min_mutual_frac=mnn_min_mutual_frac, replace=replace)
+    elif pairing == "hungarian":
+        i, j = _pairing_hungarian(cost)
+    elif pairing == "softmax":
+        i, j = _pairing_softmax(cost, tau=softmax_tau, replace=replace)
+    else:
+        raise ValueError(f"Unknown pairing strategy: {pairing}")
+    return i, j
+
+
 @torch.no_grad()
 def minibatch_pair_sample_plan(
     z0,
@@ -216,23 +222,21 @@ def minibatch_pair_sample_plan(
       z0_pi, z1_pi: both (B,...) selected by chosen pairing strategy.
     """
     cost = _cost_matrix_mse(z0, z1)
-
-    if pairing == "ot":
-        i, j = _pairing_ot(cost, ot_method=ot_method, eps=eps, iters=iters,
-                           replace=replace, num_threads=num_threads)
-    elif pairing == "mnn":
-        i, j = _pairing_mnn(cost, min_mutual_frac=mnn_min_mutual_frac, replace=replace)
-    elif pairing == "hungarian":
-        i, j = _pairing_hungarian(cost)
-    elif pairing == "softmax":
-        i, j = _pairing_softmax(cost, tau=softmax_tau, replace=replace)
-    else:
-        raise ValueError(f"Unknown pairing strategy: {pairing}")
-
+    i, j = minibatch_pair_indices_from_cost(
+        cost,
+        pairing=pairing,
+        ot_method=ot_method,
+        eps=eps,
+        iters=iters,
+        replace=replace,
+        num_threads=num_threads,
+        mnn_min_mutual_frac=mnn_min_mutual_frac,
+        softmax_tau=softmax_tau,
+    )
     return z0[i], z1[j]
 
 
-# Backward-compatible name 
+# Backward-compatible name (OT-only)
 @torch.no_grad()
 def minibatch_ot_sample_plan(
     z0,
