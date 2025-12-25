@@ -9,5 +9,8 @@
   - Mutual-NN coupling
   - Hungarian one-to-one coupling
   - Softmax (temperature) coupling
+- We explored different feature spaces for performing the coupling operation, including:
+  - Stable Diffusion VAE latent space
+  - DINOv3 pretrained feature representations
 
   
