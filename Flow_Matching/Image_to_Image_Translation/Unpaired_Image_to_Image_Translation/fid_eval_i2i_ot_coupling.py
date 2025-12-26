@@ -1,6 +1,4 @@
 # fid_eval_i2i_ot_coupling.py
-
-
 import os, random
 import torch
 from torchvision import transforms as T
@@ -111,7 +109,9 @@ def _rk4_generate_pixel_rectified(model, x0_pm1, steps=50):
         k2 = f_scalar(t0 + 0.5*h, x + 0.5*h*k1)
         k3 = f_scalar(t0 + 0.5*h, x + 0.5*h*k2)
         k4 = f_scalar(t0 + h,     x + h*k3)
+
         x  = x + (h/6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        x  = x.clamp(-1, 1)
 
     return x
 
@@ -130,6 +130,7 @@ def eval_fid_i2i_rectified(
     mode:
       - "latent": integrate in latent space, decode with VAE
       - "dino"  : integrate in pixel space
+      - "pixel" : integrate in pixel space
     """
     os.makedirs(out_dir, exist_ok=True)
     model.eval()
@@ -154,7 +155,6 @@ def eval_fid_i2i_rectified(
 
     fid = FrechetInceptionDistance(normalize=True).to(device)
 
-    # Save a few samples
     if is_rank0 and save_samples > 0:
         sample_dir = os.path.join(out_dir, f"epoch_{epoch}_samples_rectified")
         os.makedirs(sample_dir, exist_ok=True)
@@ -183,9 +183,12 @@ def eval_fid_i2i_rectified(
                 del x1_hat_pm1
 
     total_local = len(sampler) if sampler is not None else len(ds)
-    pbar = tqdm(total=total_local,
-                desc=f"FID Rectified (epoch {epoch}) [rank {rank}/{world}]",
-                ncols=100, disable=not is_rank0)
+    pbar = tqdm(
+        total=total_local,
+        desc=f"FID Rectified (epoch {epoch}) [rank {rank}/{world}]",
+        ncols=100,
+        disable=not is_rank0,
+    )
 
     if is_dist and sampler is not None:
         sampler.set_epoch(epoch)
