@@ -1,7 +1,6 @@
 # train_latent_ot_coupling.py
 # Inspired from paper "Improving and Generalizing Flow-Based Generative Models with Minibatch Optimal Transport"
 
-
 import os
 import argparse
 import copy
@@ -27,7 +26,6 @@ from ot_coupling import (
 
 from fid_eval_i2i_ot_coupling import eval_fid_i2i_rectified
 
-# Frozen SD-VAE (latent mode)
 from diffusers.models import AutoencoderKL
 
 
@@ -89,9 +87,6 @@ def _append_line(path: str, line: str):
         f.flush()
 
 
-# -----------------------------
-# GLOBAL GATHER (DDP-safe)
-# -----------------------------
 @torch.no_grad()
 def _gather_cat(x: torch.Tensor) -> torch.Tensor:
     if not (dist.is_available() and dist.is_initialized()):
@@ -102,9 +97,6 @@ def _gather_cat(x: torch.Tensor) -> torch.Tensor:
     return torch.cat(xs, dim=0)
 
 
-# -----------------------------
-# DINOv3 Feature Extractor (CLS token, frozen) - used in --mode dino
-# -----------------------------
 class DINOv3FeatureExtractor(nn.Module):
     def __init__(
         self,
@@ -160,15 +152,12 @@ class DINOv3FeatureExtractor(nn.Module):
         return feats  # [B, D]
 
 
-# -----------------------------
-# GLOBAL PAIRING: latent mode
-# -----------------------------
 @torch.no_grad()
 def global_minibatch_pair_sample_plan(
     z0_local: torch.Tensor,
     z1_local: torch.Tensor,
     args,
-) -> tuple[torch.Tensor, torch.Tensor]:
+):
     if not (dist.is_available() and dist.is_initialized()):
         z0_pi, z1_pi = minibatch_pair_sample_plan(
             z0_local,
@@ -208,22 +197,17 @@ def global_minibatch_pair_sample_plan(
     return z0_pi_all[start:end], z1_pi_all[start:end]
 
 
-# -----------------------------
-# GLOBAL PAIRING: dino mode (pair on DINO features, return paired pixels)
-# -----------------------------
 @torch.no_grad()
 def global_pair_pixels_from_dino(
     x_src_local: torch.Tensor,  # (B,3,H,W) in [-1,1]
     x_tgt_local: torch.Tensor,  # (B,3,H,W) in [-1,1]
     dino: nn.Module,            # frozen, returns (B,D)
     args,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Single-process fallback
+):
     if not (dist.is_available() and dist.is_initialized()):
         f0 = dino(x_src_local)
         f1 = dino(x_tgt_local)
 
-        # cost in feature space
         B = f0.shape[0]
         f0f = f0.view(B, -1)
         f1f = f1.view(B, -1)
@@ -245,11 +229,9 @@ def global_pair_pixels_from_dino(
     rank = dist.get_rank()
     B_local = x_src_local.size(0)
 
-    # local features
     f0_local = dino(x_src_local)
     f1_local = dino(x_tgt_local)
 
-    # gather to global
     f0_all = _gather_cat(f0_local)
     f1_all = _gather_cat(f1_local)
     x0_all = _gather_cat(x_src_local)
@@ -296,9 +278,6 @@ def main(rank, world_size, args):
     if rank0 and (not os.path.exists(loss_log_path)):
         _append_line(loss_log_path, "epoch\tavg_loss")
 
-    # -----------------------------
-    # Data
-    # -----------------------------
     transform = transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.ToTensor(),
@@ -316,9 +295,6 @@ def main(rank, world_size, args):
         drop_last=True,
     )
 
-    # -----------------------------
-    # Model (latent vs pixel)
-    # -----------------------------
     if args.mode == "latent":
         in_ch, out_ch = 4, 4
         model_channels = 192
@@ -356,9 +332,6 @@ def main(rank, world_size, args):
     ema = EMA(model.module, decay=args.ema_decay)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
 
-    # -----------------------------
-    # Frozen components
-    # -----------------------------
     vae = None
     dino = None
 
@@ -367,7 +340,7 @@ def main(rank, world_size, args):
         vae.eval()
         for p in vae.parameters():
             p.requires_grad = False
-    else:
+    elif args.mode == "dino":
         dino = DINOv3FeatureExtractor(
             repo_dir=args.dino_repo_dir,
             weights=args.dino_weights,
@@ -413,11 +386,22 @@ def main(rank, world_size, args):
                     z_t = (1.0 - t_b) * z0_pi + t_b * z1_pi
                     target_vel = (z1_pi - z0_pi)
                     inp = z_t
-                else:
+
+                elif args.mode == "dino":
                     x0_pi, x1_pi = global_pair_pixels_from_dino(
                         x_src_local=x_src,
                         x_tgt_local=x_tgt,
                         dino=dino,
+                        args=args,
+                    )
+                    x_t = (1.0 - t_b) * x0_pi + t_b * x1_pi
+                    target_vel = (x1_pi - x0_pi)
+                    inp = x_t
+
+                else:  # pixel
+                    x0_pi, x1_pi = global_minibatch_pair_sample_plan(
+                        z0_local=x_src,
+                        z1_local=x_tgt,
                         args=args,
                     )
                     x_t = (1.0 - t_b) * x0_pi + t_b * x1_pi
@@ -494,9 +478,13 @@ def main(rank, world_size, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    # ---- mode switch ----
-    parser.add_argument("--mode", type=str, default="latent", choices=["latent", "dino"],
-                        help="latent: SD-VAE latent rectified flow; dino: pixel rectified flow with pairing in DINOv3 feature space.")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="latent",
+        choices=["latent", "dino", "pixel"],
+        help="latent: SD-VAE latent rectified flow; dino: pixel rectified flow with pairing in DINOv3 feature space; pixel: pixel rectified flow with pairing in pixel space.",
+    )
 
     parser.add_argument("--data_root", type=str, required=True,
                         help="Path containing trainA/trainB folders (unpaired dataset).")
@@ -515,7 +503,6 @@ if __name__ == "__main__":
     parser.add_argument("--eval_interval", type=int, default=5)
     parser.add_argument("--no_fid", action="store_true")
 
-    # latent-only (still present; ignored for --mode dino)
     parser.add_argument("--vae_id", type=str, default="stabilityai/sd-vae-ft-mse",
                         help="HuggingFace id for SD-VAE (used in --mode latent).")
     parser.add_argument("--scale_factor", type=float, default=0.18215)
@@ -525,9 +512,6 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_steps", type=int, default=2000,
                         help="Number of warmup steps for learning rate.")
 
-    # -----------------------------
-    # Pairing strategy (SAME for BOTH modes)
-    # -----------------------------
     parser.add_argument("--pairing", type=str, default="ot",
                         choices=["ot", "mnn", "hungarian", "softmax"],
                         help="Batch pairing strategy for unpaired coupling.")
@@ -546,7 +530,6 @@ if __name__ == "__main__":
     parser.add_argument("--ot_num_threads", type=int, default=1,
                         help="Threads for exact OT (POT emd).")
 
-    # DINOv3 (used in --mode dino; ignored for --mode latent)
     parser.add_argument("--dino_repo_dir", type=str,
                         default="path/to/github_repository/dinov3",
                         help="Local repo dir for torch.hub.load of DINOv3.")
