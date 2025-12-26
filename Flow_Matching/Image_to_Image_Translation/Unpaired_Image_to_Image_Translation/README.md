@@ -12,5 +12,6 @@
 - We explored different feature spaces for performing the coupling operation, including:
   - Stable Diffusion VAE latent space
   - DINOv3 pretrained feature representations
+  - Plain pixel level representation
 
   
