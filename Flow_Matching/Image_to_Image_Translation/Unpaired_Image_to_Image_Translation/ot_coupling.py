@@ -125,14 +125,19 @@ def _pairing_mnn(cost, min_mutual_frac=0.25, replace=True):
         non_mutual_i = torch.nonzero(~mutual_mask, as_tuple=False).squeeze(1)
         if non_mutual_i.numel() > 0:
             if replace:
-                pick = torch.randint(low=0, high=mutual_j.numel(),
-                                     size=(non_mutual_i.numel(),), device=device)
+                pick = torch.randint(
+                    low=0, high=mutual_j.numel(), size=(non_mutual_i.numel(),), device=device
+                )
             else:
                 perm = torch.randperm(mutual_j.numel(), device=device)
                 pick = perm[: min(non_mutual_i.numel(), mutual_j.numel())]
                 if pick.numel() < non_mutual_i.numel():
-                    extra = torch.randint(low=0, high=mutual_j.numel(),
-                                          size=(non_mutual_i.numel() - pick.numel(),), device=device)
+                    extra = torch.randint(
+                        low=0,
+                        high=mutual_j.numel(),
+                        size=(non_mutual_i.numel() - pick.numel(),),
+                        device=device,
+                    )
                     pick = torch.cat([pick, extra], dim=0)
 
             j[non_mutual_i] = mutual_j[pick]
@@ -146,9 +151,7 @@ def _pairing_hungarian(cost):
     try:
         from scipy.optimize import linear_sum_assignment
     except Exception as e:
-        raise RuntimeError(
-            "Hungarian pairing requires scipy. Install with: pip install scipy"
-        ) from e
+        raise RuntimeError("Hungarian pairing requires scipy. Install with: pip install scipy") from e
 
     C = cost.detach().cpu().numpy()
     row_ind, col_ind = linear_sum_assignment(C)
@@ -176,7 +179,7 @@ def _pairing_softmax(cost, tau=0.1, replace=True):
 @torch.no_grad()
 def minibatch_pair_indices_from_cost(
     cost: torch.Tensor,
-    pairing="ot",                 # {"ot","mnn","hungarian","softmax"}
+    pairing="ot",  # {"ot","mnn","hungarian","softmax"}
     ot_method="exact",
     eps=0.05,
     iters=50,
@@ -190,8 +193,14 @@ def minibatch_pair_indices_from_cost(
     Returns: i, j indices (both length B).
     """
     if pairing == "ot":
-        i, j = _pairing_ot(cost, ot_method=ot_method, eps=eps, iters=iters,
-                           replace=replace, num_threads=num_threads)
+        i, j = _pairing_ot(
+            cost,
+            ot_method=ot_method,
+            eps=eps,
+            iters=iters,
+            replace=replace,
+            num_threads=num_threads,
+        )
     elif pairing == "mnn":
         i, j = _pairing_mnn(cost, min_mutual_frac=mnn_min_mutual_frac, replace=replace)
     elif pairing == "hungarian":
@@ -207,7 +216,7 @@ def minibatch_pair_indices_from_cost(
 def minibatch_pair_sample_plan(
     z0,
     z1,
-    pairing="ot",                 # {"ot","mnn","hungarian","softmax"}
+    pairing="ot",  # {"ot","mnn","hungarian","softmax"}
     ot_method="exact",
     eps=0.05,
     iters=50,
@@ -236,7 +245,6 @@ def minibatch_pair_sample_plan(
     return z0[i], z1[j]
 
 
-# Backward-compatible name (OT-only)
 @torch.no_grad()
 def minibatch_ot_sample_plan(
     z0,
@@ -248,7 +256,8 @@ def minibatch_ot_sample_plan(
     num_threads=1,
 ):
     return minibatch_pair_sample_plan(
-        z0, z1,
+        z0,
+        z1,
         pairing="ot",
         ot_method=ot_method,
         eps=eps,
