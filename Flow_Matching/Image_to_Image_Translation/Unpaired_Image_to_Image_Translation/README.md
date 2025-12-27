@@ -13,5 +13,6 @@
   - Stable Diffusion VAE latent space
   - DINOv3 pretrained feature representations
   - Plain pixel level representation
+  - LPIPS-style perceptual feature space (VGG16 features) for OT cost computation
 
   
