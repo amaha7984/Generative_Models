@@ -207,6 +207,84 @@ class VGGFeatureSpace(nn.Module):
         return torch.cat(feats, dim=1)  # (B, D)
 
 
+# -----------------------------
+# CLIP Feature Space (open_clip, frozen) - used in --mode clip
+# -----------------------------
+class CLIPFeatureSpace(nn.Module):
+    """
+    Frozen CLIP image encoder for pairing cost. Input: x in [-1,1] (B,3,H,W).
+    Resizes ONLY for CLIP extraction (e.g., 224), does not change training resolution.
+    """
+    def __init__(
+        self,
+        model_name: str = "ViT-B-32",
+        pretrained: str = "openai",
+        normalize: bool = True,
+        use_fp16: bool = False,
+        force_input_size: int | None = None,
+    ):
+        super().__init__()
+        # Lazy import so non-clip modes don't require open_clip_torch installed
+        import open_clip  # pip install open_clip_torch
+
+        model, _, _ = open_clip.create_model_and_transforms(
+            model_name=model_name,
+            pretrained=pretrained,
+        )
+        self.model = model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+        self.normalize = bool(normalize)
+        self.use_fp16 = bool(use_fp16)
+
+        # CLIP normalization constants
+        self.register_buffer("mean", torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1))
+        self.register_buffer("std",  torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1))
+
+        # Determine expected CLIP input size
+        model_img_size = None
+        if hasattr(self.model, "visual") and hasattr(self.model.visual, "image_size"):
+            model_img_size = self.model.visual.image_size
+            if isinstance(model_img_size, tuple):
+                model_img_size = model_img_size[0]
+        self.clip_size = int(force_input_size or model_img_size or 224)
+
+        # Track if we already casted to fp16
+        self._fp16_ready = False
+
+    def _pm1_to_clip_norm(self, x_pm1: torch.Tensor) -> torch.Tensor:
+        x01 = (x_pm1.clamp(-1, 1) + 1.0) / 2.0
+        return (x01 - self.mean) / self.std
+
+    @torch.no_grad()
+    def forward(self, x_pm1: torch.Tensor) -> torch.Tensor:
+        # Resize ONLY for CLIP extraction
+        if x_pm1.shape[-1] != self.clip_size or x_pm1.shape[-2] != self.clip_size:
+            x_pm1 = F.interpolate(
+                x_pm1,
+                size=(self.clip_size, self.clip_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        x = self._pm1_to_clip_norm(x_pm1)
+
+        if self.use_fp16 and x.is_cuda and (not self._fp16_ready):
+            self.model = self.model.half()
+            self._fp16_ready = True
+
+        if self.use_fp16 and x.is_cuda:
+            x = x.half()
+
+        feats = self.model.encode_image(x).float()
+
+        if self.normalize:
+            feats = F.normalize(feats, dim=1, eps=1e-8)
+
+        return feats  # (B, D)
+
+
 @torch.no_grad()
 def _pairwise_cost_from_features(f0: torch.Tensor, f1: torch.Tensor, metric: str = "cosine") -> torch.Tensor:
     if metric == "cosine":
@@ -280,10 +358,7 @@ def global_pair_pixels_from_dino(
         f0 = dino(x_src_local)
         f1 = dino(x_tgt_local)
 
-        B = f0.shape[0]
-        f0f = f0.view(B, -1)
-        f1f = f1.view(B, -1)
-        cost = ((f0f[:, None, :] - f1f[None, :, :]) ** 2).mean(dim=2)
+        cost = ((f0[:, None, :] - f1[None, :, :]) ** 2).mean(dim=2)
 
         i, j = minibatch_pair_indices_from_cost(
             cost,
@@ -309,10 +384,7 @@ def global_pair_pixels_from_dino(
     x0_all = _gather_cat(x_src_local)
     x1_all = _gather_cat(x_tgt_local)
 
-    G = f0_all.shape[0]
-    f0f = f0_all.view(G, -1)
-    f1f = f1_all.view(G, -1)
-    cost = ((f0f[:, None, :] - f1f[None, :, :]) ** 2).mean(dim=2)
+    cost = ((f0_all[:, None, :] - f1_all[None, :, :]) ** 2).mean(dim=2)
 
     i, j = minibatch_pair_indices_from_cost(
         cost,
@@ -452,6 +524,66 @@ def global_pair_pixels_from_vgg(
     return x0_pi_all[start:end], x1_pi_all[start:end]
 
 
+# -----------------------------
+# GLOBAL PAIRING: clip mode (pair on CLIP feature cost, return paired pixels)
+# -----------------------------
+@torch.no_grad()
+def global_pair_pixels_from_clip(
+    x_src_local: torch.Tensor,  # (B,3,H,W) in [-1,1]
+    x_tgt_local: torch.Tensor,  # (B,3,H,W) in [-1,1]
+    clip: nn.Module,            # frozen, returns (B,D)
+    args,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not (dist.is_available() and dist.is_initialized()):
+        f0 = clip(x_src_local)
+        f1 = clip(x_tgt_local)
+        cost = _pairwise_cost_from_features(f0.float(), f1.float(), metric=args.clip_metric)
+        i, j = minibatch_pair_indices_from_cost(
+            cost,
+            pairing=args.pairing,
+            ot_method=args.ot_method,
+            eps=args.ot_eps,
+            iters=args.ot_iters,
+            replace=args.ot_replace,
+            num_threads=args.ot_num_threads,
+            mnn_min_mutual_frac=args.mnn_min_mutual_frac,
+            softmax_tau=args.softmax_tau,
+        )
+        return x_src_local[i], x_tgt_local[j]
+
+    rank = dist.get_rank()
+    B_local = x_src_local.size(0)
+
+    f0_local = clip(x_src_local)
+    f1_local = clip(x_tgt_local)
+
+    f0_all = _gather_cat(f0_local)
+    f1_all = _gather_cat(f1_local)
+    x0_all = _gather_cat(x_src_local)
+    x1_all = _gather_cat(x_tgt_local)
+
+    cost = _pairwise_cost_from_features(f0_all.float(), f1_all.float(), metric=args.clip_metric)
+
+    i, j = minibatch_pair_indices_from_cost(
+        cost,
+        pairing=args.pairing,
+        ot_method=args.ot_method,
+        eps=args.ot_eps,
+        iters=args.ot_iters,
+        replace=args.ot_replace,
+        num_threads=args.ot_num_threads,
+        mnn_min_mutual_frac=args.mnn_min_mutual_frac,
+        softmax_tau=args.softmax_tau,
+    )
+
+    x0_pi_all = x0_all[i]
+    x1_pi_all = x1_all[j]
+
+    start = rank * B_local
+    end = start + B_local
+    return x0_pi_all[start:end], x1_pi_all[start:end]
+
+
 def main(rank, world_size, args):
     local_rank = setup_ddp(rank, world_size)
 
@@ -499,6 +631,7 @@ def main(rank, world_size, args):
         channel_mult = (1, 2, 3, 4)
         num_heads = 4
     else:
+        # pixel-like modes: dino/pixel/lpips/clip
         in_ch, out_ch = 3, 3
         model_channels = 128
         num_res_blocks = 2
@@ -534,6 +667,7 @@ def main(rank, world_size, args):
     vae = None
     dino = None
     vgg = None
+    clip = None
 
     if args.mode == "latent":
         vae = AutoencoderKL.from_pretrained(args.vae_id).to(local_rank)
@@ -554,6 +688,16 @@ def main(rank, world_size, args):
     if args.mode == "lpips":
         vgg = VGGFeatureSpace(layers=args.lpips_layers, use_fp16=args.lpips_fp16).to(local_rank)
         vgg.eval()
+
+    if args.mode == "clip":
+        clip = CLIPFeatureSpace(
+            model_name=args.clip_model,
+            pretrained=args.clip_pretrained,
+            normalize=True,
+            use_fp16=args.clip_fp16,
+            force_input_size=(None if args.clip_force_input_size <= 0 else args.clip_force_input_size),
+        ).to(local_rank)
+        clip.eval()
 
     criterion = nn.MSELoss()
     scaler = torch.cuda.amp.GradScaler()
@@ -618,6 +762,17 @@ def main(rank, world_size, args):
                         x_src_local=x_src,
                         x_tgt_local=x_tgt,
                         vgg=vgg,
+                        args=args,
+                    )
+                    x_t = (1.0 - t_b) * x0_pi + t_b * x1_pi
+                    target_vel = (x1_pi - x0_pi)
+                    inp = x_t
+
+                elif args.mode == "clip":
+                    x0_pi, x1_pi = global_pair_pixels_from_clip(
+                        x_src_local=x_src,
+                        x_tgt_local=x_tgt,
+                        clip=clip,
                         args=args,
                     )
                     x_t = (1.0 - t_b) * x0_pi + t_b * x1_pi
@@ -702,9 +857,10 @@ if __name__ == "__main__":
         "--mode",
         type=str,
         default="latent",
-        choices=["latent", "dino", "pixel", "lpips"],
+        choices=["latent", "dino", "pixel", "lpips", "clip"],
         help="latent: SD-VAE latent rectified flow; dino: pixel rectified flow with pairing in DINOv3 feature space; "
-             "pixel: pixel rectified flow with pixel-cost pairing; lpips: pixel rectified flow with VGG feature-cost pairing.",
+             "pixel: pixel rectified flow with pixel-cost pairing; lpips: pixel rectified flow with VGG feature-cost pairing; "
+             "clip: pixel rectified flow with pairing in CLIP feature space (open_clip).",
     )
 
     parser.add_argument("--data_root", type=str, required=True,
@@ -774,6 +930,18 @@ if __name__ == "__main__":
                         help="Feature cost metric for LPIPS-like pairing.")
     parser.add_argument("--lpips_fp16", action="store_true",
                         help="Run VGG feature extractor in fp16 on CUDA.")
+
+    # CLIP (used in --mode clip)
+    parser.add_argument("--clip_model", type=str, default="ViT-B-32",
+                        help="open_clip model name (e.g., ViT-B-32).")
+    parser.add_argument("--clip_pretrained", type=str, default="openai",
+                        help="open_clip pretrained tag (e.g., openai, laion2b_s34b_b79k, etc.).")
+    parser.add_argument("--clip_fp16", action="store_true",
+                        help="Run CLIP image encoder in fp16 on CUDA.")
+    parser.add_argument("--clip_force_input_size", type=int, default=0,
+                        help="If > 0, override CLIP input resize (e.g., 224). If <=0, use model default.")
+    parser.add_argument("--clip_metric", type=str, default="cosine", choices=["cosine", "l2"],
+                        help="Feature cost metric for CLIP pairing.")
 
     args = parser.parse_args()
 
