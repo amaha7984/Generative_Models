@@ -14,5 +14,6 @@
   - DINOv3 pretrained feature representations
   - Plain pixel level representation
   - LPIPS-style perceptual feature space (VGG16 features) for OT cost computation
+  - CLIP visual feature space (CLIP image embeddings) for OT cost computation
 
   
