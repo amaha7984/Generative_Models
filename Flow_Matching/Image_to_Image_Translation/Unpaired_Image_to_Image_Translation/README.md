@@ -16,4 +16,9 @@
   - LPIPS-style perceptual feature space (VGG16 features) for OT cost computation
   - CLIP visual feature space (CLIP image embeddings) for OT cost computation
 - Training: We support single gpu as well as DDP multi-gpu training.
+- Inference: We will support multiple inference for translation.
+  - RK4
+  - Euler
+  - ODE "dopri5"
+
   
