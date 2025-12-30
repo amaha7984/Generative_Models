@@ -9,6 +9,7 @@
   - Mutual-NN coupling
   - Hungarian one-to-one coupling
   - Softmax (temperature) coupling
+  - Important Note_1: We did not find optimal translation performance with Mini-batch OT coupling.
 - We explored different feature spaces for performing the coupling operation, including:
   - Stable Diffusion VAE latent space
   - DINOv3 pretrained feature representations
